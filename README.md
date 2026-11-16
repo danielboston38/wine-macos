@@ -29,8 +29,9 @@ through Rosetta 2.
 
 The result is `dist/Wine-11.22.app`. The first build downloads and compiles the
 dependencies (pinned in `deps/manifest.sh`, with checksums), then compiles Wine. That takes
-a while. Later builds reuse the dependencies. `./build.sh wine-11.22 --clean` compiles
-Wine again from scratch, but keeps the dependencies.
+a while. Later builds reuse the dependencies and the configured Wine build tree, so they
+compile only what changed. `./build.sh wine-11.22 --clean` configures and compiles Wine
+again from scratch, but keeps the dependencies.
 
 Any Wine tag works: `git -C ~/build/wine tag -l 'wine-*'`.
 
