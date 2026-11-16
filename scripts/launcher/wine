@@ -1,0 +1,24 @@
+#!/bin/bash
+# Wine.app launcher. With arguments it runs wine; with none (double-click)
+# it opens a Terminal window set up to use this Wine.
+set -euo pipefail
+
+# Follow symlinks (e.g. /usr/local/bin/wine -> this file) to find the app.
+self=$0
+while [ -L "$self" ]; do
+    target=$(readlink "$self")
+    case $target in
+        /*) self=$target ;;
+        *) self="$(dirname "$self")/$target" ;;
+    esac
+done
+app="$(cd "$(dirname "$self")/../.." && pwd -P)"
+export WINE_ROOT="$app/Contents/Resources/wine"
+# Wine loads its libraries by leaf name; this is where dyld finds them.
+export DYLD_FALLBACK_LIBRARY_PATH="$WINE_ROOT/lib:/usr/lib"
+export PATH="$app/Contents/MacOS:$WINE_ROOT/bin:$PATH"
+
+if [ $# -gt 0 ]; then
+    exec "$WINE_ROOT/bin/wine" "$@"
+fi
+exec open -a Terminal "$app/Contents/Resources/wine-shell.command"
