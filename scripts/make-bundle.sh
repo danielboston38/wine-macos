@@ -57,6 +57,14 @@ fix_macho() {
     fi
 }
 
+# strip_pe_debug <wine_root>: remove debug info from the Windows DLLs and
+# EXEs (built with -g; about 1 GB of the app otherwise).
+strip_pe_debug() {
+    local root=$1
+    find "$root/lib/wine/x86_64-windows" -type f -print0 | xargs -0 x86_64-w64-mingw32-strip --strip-debug
+    find "$root/lib/wine/i386-windows" -type f -print0 | xargs -0 i686-w64-mingw32-strip --strip-debug
+}
+
 main() {
     local tag=$1 stage=$2 version app res root f launcher_dir
     [ -x "$stage/bin/wine" ] || die "not a Wine stage dir: $stage"
@@ -76,6 +84,9 @@ main() {
     cp -a "$stage/." "$root/"
     mkdir -p "$root/lib"
     cp -a "$DEPS_PREFIX"/lib/*.dylib "$root/lib/"
+
+    log "stripping debug info from Windows binaries"
+    strip_pe_debug "$root"
 
     log "fixing up library paths"
     for f in "$DEPS_PREFIX"/lib/*.dylib; do

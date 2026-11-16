@@ -27,6 +27,18 @@ clang -arch x86_64 -dynamiclib -install_name @rpath/libgood.dylib \
 find_foreign_paths "$GOOD" >/dev/null; rc=$?
 assert_eq 0 "$rc" "find_foreign_paths passes a clean app"
 
+# strip_pe_debug removes debug info from both PE architectures
+PE="$TMP/pe-root"
+mkdir -p "$PE/lib/wine/x86_64-windows" "$PE/lib/wine/i386-windows"
+x86_64-w64-mingw32-gcc -g -shared -o "$PE/lib/wine/x86_64-windows/f.dll" "$TMP/f.c"
+i686-w64-mingw32-gcc -g -shared -o "$PE/lib/wine/i386-windows/f.dll" "$TMP/f.c"
+assert_contains "$(x86_64-w64-mingw32-objdump -h "$PE/lib/wine/x86_64-windows/f.dll")" ".debug_info" "test DLL starts with debug info"
+strip_pe_debug "$PE"
+for a in x86_64 i386; do
+    out=$(x86_64-w64-mingw32-objdump -h "$PE/lib/wine/$a-windows/f.dll" 2>&1)
+    assert_eq 0 "$(echo "$out" | grep -c '\.debug_')" "$a DLL has no debug sections"
+done
+
 # launcher resolves its own location at run time (moved, renamed, spaces)
 FAKE="$TMP/My Apps/Wine Devel.app"
 mkdir -p "$FAKE/Contents/MacOS" "$FAKE/Contents/Resources/wine/bin"
@@ -55,6 +67,8 @@ if [ "${BUNDLE_IT:-}" = 1 ]; then
     assert_eq 0 "$rc" "no foreign paths in the app"
     codesign --verify --deep --strict "$app"; rc=$?
     assert_eq 0 "$rc" "codesign verifies"
+    assert_eq 0 "$(x86_64-w64-mingw32-objdump -h "$app/Contents/Resources/wine/lib/wine/x86_64-windows/kernel32.dll" | grep -c '\.debug_')" \
+        "bundled kernel32.dll has no debug sections"
     assert_eq 11.22 "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" "version in Info.plist"
     MOVED="$TMP/My Apps/Wine Devel.app"
     rm -rf "$MOVED"

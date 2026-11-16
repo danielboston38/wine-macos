@@ -26,6 +26,28 @@ check_wine_config() {
     fi
 }
 
+# configure_wine <src> <build> <stage>: run configure in build, unless an
+# earlier run left config.status there and deps/manifest.sh has not changed
+# since. configure records each bundled library's file name (e.g.
+# libgnutls.30.dylib), so a dependency bump must reconfigure. make reruns
+# configure itself when Wine's own configure changes; --clean forces it.
+configure_wine() {
+    local src=$1 build=$2 stage=$3 deps_sum
+    deps_sum=$(shasum -a 256 < "$REPO_ROOT/deps/manifest.sh")
+    if [ -e "$build/config.status" ] && [ "$(cat "$build/deps-manifest.sha256" 2>/dev/null)" = "$deps_sum" ]; then
+        log "already configured, skipping configure (use --clean to redo)"
+    else
+        log "configuring $(basename "$build")"
+        # Explicit triplets: under Rosetta, uname still reports arm64 to
+        # configure's child processes, so it cannot detect x86_64 by itself.
+        (cd "$build" && run_x86 "$src/configure" --build=x86_64-apple-darwin \
+            --host=x86_64-apple-darwin --prefix="$stage" --enable-archs=i386,x86_64 \
+            --without-x --disable-tests >&2)
+        echo "$deps_sum" > "$build/deps-manifest.sha256"
+    fi
+    check_wine_config "$build/include/config.h"
+}
+
 main() {
     local tag=$1 src build stage
     validate_tag "$tag"
@@ -45,17 +67,14 @@ main() {
 
     mkdir -p "$build"
     cd "$build"
-    log "configuring $tag"
-    # Explicit triplets: under Rosetta, uname still reports arm64 to
-    # configure's child processes, so it cannot detect x86_64 by itself.
-    run_x86 "$src/configure" --build=x86_64-apple-darwin --host=x86_64-apple-darwin \
-        --prefix="$stage" --enable-archs=i386,x86_64 \
-        --without-x --disable-tests >&2
-    check_wine_config "$build/include/config.h"
+    configure_wine "$src" "$build" "$stage"
 
     log "building $tag"
     run_x86 make -j"$(sysctl -n hw.ncpu)" >&2
-    run_x86 make install >&2
+    # install-lib: only what running programs needs (no headers, import libs
+    # or winegcc). Start from an empty stage so nothing stale is left over.
+    rm -rf "$stage"
+    run_x86 make install-lib >&2
 
     echo "$stage"
 }

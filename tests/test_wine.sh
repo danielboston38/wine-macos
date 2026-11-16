@@ -22,6 +22,24 @@ err=$( (check_wine_config "$TESTS_DIR/fixtures/config_missing_gnutls.h") 2>&1 );
 assert_eq 1 "$rc" "config.h without GnuTLS fails"
 assert_contains "$err" "GnuTLS" "missing GnuTLS named"
 
+# configure_wine runs configure only when the build dir has no config.status
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+run_x86() { echo "configure-ran" >> "$TMP/calls"; }
+check_wine_config() { :; }
+mkdir -p "$TMP/build"
+( configure_wine "$TMP/src" "$TMP/build" "$TMP/stage" ) 2>/dev/null
+assert_eq 1 "$(grep -c configure-ran "$TMP/calls" 2>/dev/null)" "configure runs in a fresh build dir"
+touch "$TMP/build/config.status"
+( configure_wine "$TMP/src" "$TMP/build" "$TMP/stage" ) 2>/dev/null
+assert_eq 1 "$(grep -c configure-ran "$TMP/calls")" "configure is skipped when config.status exists"
+echo stale > "$TMP/build/deps-manifest.sha256"
+( configure_wine "$TMP/src" "$TMP/build" "$TMP/stage" ) 2>/dev/null
+assert_eq 2 "$(grep -c configure-ran "$TMP/calls")" "configure reruns when deps/manifest.sh changed"
+unset -f run_x86 check_wine_config
+# shellcheck source=scripts/build-wine.sh
+. "$TESTS_DIR/../scripts/build-wine.sh"
+
 # integration: real Wine build (slow)
 if [ "${WINE_IT:-}" = 1 ]; then
     LOG="$WORK_DIR/build-wine-test.log"
@@ -32,6 +50,8 @@ if [ "${WINE_IT:-}" = 1 ]; then
     assert_eq x86_64 "$(lipo -archs "$stage/bin/wine")" "bin/wine is x86_64"
     assert_file "$stage/lib/wine/i386-windows/kernel32.dll"
     assert_file "$stage/lib/wine/x86_64-windows/kernel32.dll"
+    assert_eq 0 "$(find "$stage" -name '*.a' | wc -l | tr -d ' ')" "no import libraries installed"
+    assert_eq 1 "$([ ! -e "$stage/include" ] && echo 1)" "no headers installed"
     assert_eq wine-11.22 "$(DYLD_FALLBACK_LIBRARY_PATH="$DEPS_PREFIX/lib" "$stage/bin/wine" --version)" "wine --version"
 fi
 
