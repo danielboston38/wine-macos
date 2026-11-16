@@ -38,6 +38,13 @@ out=$(env -i HOME="$HOME" PATH=/usr/bin:/bin "$FAKE/Contents/MacOS/wine" --versi
 assert_eq "root=$(cd "$FAKE" && pwd -P)/Contents/Resources/wine args=--version a b" "$out" \
     "launcher finds its own bundle and passes args through"
 
+# launcher still finds its bundle when started through a symlink (e.g. /usr/local/bin/wine)
+mkdir -p "$TMP/bin"
+ln -s "$FAKE/Contents/MacOS/wine" "$TMP/bin/wine"
+out=$(env -i HOME="$HOME" PATH=/usr/bin:/bin "$TMP/bin/wine" --version)
+assert_eq "root=$(cd "$FAKE" && pwd -P)/Contents/Resources/wine args=--version" "$out" \
+    "launcher works through a symlink"
+
 # integration: real bundle from Task 4's stage
 if [ "${BUNDLE_IT:-}" = 1 ]; then
     if ! app=$("$TESTS_DIR/../scripts/make-bundle.sh" wine-11.22 "$WORK_DIR/stage/wine-11.22" 2>"$TMP/bundle.log" | tail -1); then

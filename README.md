@@ -54,6 +54,17 @@ From any other shell, call the launcher inside the app:
 /Applications/Wine-11.22.app/Contents/MacOS/wine notepad
 ```
 
+To type plain `wine` in any shell, link the launcher onto your PATH:
+
+```sh
+ln -s /Applications/Wine-11.22.app/Contents/MacOS/wine /usr/local/bin/wine
+```
+
+Always start Wine through this launcher, never through `Contents/Resources/wine/bin/wine`.
+Wine loads FreeType (fonts), GnuTLS (secure connections) and MoltenVK (Vulkan) by file name
+only. The launcher tells macOS to look for those files inside the app. Without it, text,
+HTTPS and Vulkan can quietly fail.
+
 When Wine sets up a new prefix (`~/.wine` by default), it asks whether to download
 Wine Mono (.NET) and Wine Gecko (HTML). Programs that need them will not work without them.
 
