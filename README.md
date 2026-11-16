@@ -12,7 +12,7 @@ through Rosetta 2.
 - An Apple Silicon Mac with macOS 12 or later.
 - Rosetta 2: `softwareupdate --install-rosetta`
 - Xcode Command Line Tools: `xcode-select --install`
-- Homebrew build tools: `brew install mingw-w64 bison meson ninja cmake pkg-config autoconf`
+- Homebrew build tools: `brew install mingw-w64 bison ninja cmake pkg-config`
 - A clone of upstream Wine with its tags at `~/build/wine` (or set `WINE_GIT`):
 
   ```sh

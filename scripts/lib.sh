@@ -35,7 +35,7 @@ check_prereqs() {
     elif [ "$(bison --version | head -1 | sed 's/.* \([0-9]*\)\..*/\1/')" -lt 3 ]; then
         missing+=("bison >= 3 (brew install bison)")
     fi
-    for tool in flex meson ninja cmake pkg-config autoreconf git curl shasum; do
+    for tool in flex ninja cmake pkg-config git curl shasum; do
         command -v "$tool" >/dev/null || missing+=("$tool")
     done
     if [ "${#missing[@]}" -gt 0 ]; then

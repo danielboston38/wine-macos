@@ -10,7 +10,7 @@ TESTS_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 err=$( (PATH=/usr/bin:/bin check_prereqs) 2>&1 >/dev/null ); rc=$?
 assert_eq 1 "$rc" "check_prereqs fails with a bare PATH"
 assert_contains "$err" "mingw-w64" "missing mingw-w64 reported"
-assert_contains "$err" "meson" "missing meson reported in the same message"
+assert_contains "$err" "ninja" "missing ninja reported in the same message"
 
 ( check_prereqs ) >/dev/null 2>&1; rc=$?
 assert_eq 0 "$rc" "check_prereqs succeeds with the real PATH"
