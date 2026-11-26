@@ -33,7 +33,13 @@ a while. Later builds reuse the dependencies and the configured Wine build tree,
 compile only what changed. `./build.sh wine-11.22 --clean` configures and compiles Wine
 again from scratch, but keeps the dependencies.
 
-Any Wine tag works: `git -C ~/build/wine tag -l 'wine-*'`.
+Any Wine tag works. To list them in version order, newest last:
+
+```sh
+git -C ~/build/wine tag -l 'wine-[0-9]*.*' --sort=v:refname | tail
+```
+
+Run `git -C ~/build/wine fetch --tags` to get new releases.
 
 ## Install
 

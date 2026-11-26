@@ -21,6 +21,21 @@ assert_eq 0 "$rc" "complete config.h passes"
 err=$( (check_wine_config "$TESTS_DIR/fixtures/config_missing_gnutls.h") 2>&1 ); rc=$?
 assert_eq 1 "$rc" "config.h without GnuTLS fails"
 assert_contains "$err" "GnuTLS" "missing GnuTLS named"
+err=$( (check_wine_config "$TESTS_DIR/fixtures/config_system_vulkan.h") 2>&1 ); rc=$?
+assert_eq 1 "$rc" "config.h with a system Vulkan loader fails"
+assert_contains "$err" "MoltenVK" "wrong Vulkan library named"
+
+# configure_wine forces the bundled MoltenVK over a system Vulkan loader
+TMP_ARGS=$(mktemp -d)
+run_x86() { printf '%s\n' "$@" > "$TMP_ARGS/args"; }
+check_wine_config() { :; }
+mkdir -p "$TMP_ARGS/build"
+( configure_wine "$TMP_ARGS/src" "$TMP_ARGS/build" "$TMP_ARGS/stage" ) 2>/dev/null
+assert_eq 1 "$(grep -cx 'ac_cv_lib_soname_vulkan=' "$TMP_ARGS/args")" "configure skips the system Vulkan loader"
+rm -rf "$TMP_ARGS"
+unset -f run_x86 check_wine_config
+# shellcheck source=scripts/build-wine.sh
+. "$TESTS_DIR/../scripts/build-wine.sh"
 
 # configure_wine runs configure only when the build dir has no config.status
 TMP=$(mktemp -d)
