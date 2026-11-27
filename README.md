@@ -75,6 +75,21 @@ HTTPS and Vulkan can quietly fail.
 When Wine sets up a new prefix (`~/.wine` by default), it asks whether to download
 Wine Mono (.NET) and Wine Gecko (HTML). Programs that need them will not work without them.
 
+## Direct3D 10 and 11 (DXVK)
+
+Wine's own Direct3D runs on OpenGL. For better speed in Direct3D 10 and 11 games, install
+[DXVK-macOS](https://github.com/Gcenx/DXVK-macOS) into a prefix. It translates Direct3D to
+Vulkan, which runs on the MoltenVK inside the app:
+
+```sh
+WINEPREFIX=~/Games/myprefix wine wineboot     # once, if the prefix is new
+WINE=/Applications/Wine-11.22.app/Contents/MacOS/wine scripts/install-dxvk.sh ~/Games/myprefix
+```
+
+The script downloads a pinned release, checks its checksum, copies the DLLs into the prefix
+and sets the DLL overrides. Leave out `WINE=` if `wine` is on your PATH. To go back to Wine's
+own Direct3D, delete the `d3d11` and `d3d10core` overrides in `winecfg` (Libraries tab).
+
 ## Tests
 
 ```sh
