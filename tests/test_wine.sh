@@ -55,6 +55,35 @@ unset -f run_x86 check_wine_config
 # shellcheck source=scripts/build-wine.sh
 . "$TESTS_DIR/../scripts/build-wine.sh"
 
+# apply_patches applies patches/*.patch once, in order, and fails loudly
+TMP_P=$(mktemp -d)
+git -C "$TMP_P" init -q src
+printf 'a\n' > "$TMP_P/src/f"
+git -C "$TMP_P/src" add f && git -C "$TMP_P/src" -c user.name=t -c user.email=t@t commit -qm init
+mkdir "$TMP_P/patches"
+# two patches, the second on top of the first: a -> b -> c
+printf 'b\n' > "$TMP_P/src/f"; git -C "$TMP_P/src" diff > "$TMP_P/patches/0001-b.patch"
+git -C "$TMP_P/src" -c user.name=t -c user.email=t@t commit -qam b
+printf 'c\n' > "$TMP_P/src/f"; git -C "$TMP_P/src" diff > "$TMP_P/patches/0002-c.patch"
+git -C "$TMP_P/src" checkout -q f && git -C "$TMP_P/src" reset -q --hard HEAD~1
+( apply_patches "$TMP_P/src" "$TMP_P/patches" ) 2>/dev/null; rc=$?
+assert_eq 0 "$rc" "apply_patches succeeds on a clean checkout"
+assert_eq c "$(cat "$TMP_P/src/f")" "patches applied in order"
+( apply_patches "$TMP_P/src" "$TMP_P/patches" ) 2>/dev/null; rc=$?
+assert_eq 0 "$rc" "apply_patches is a no-op when already applied"
+assert_eq c "$(cat "$TMP_P/src/f")" "second run changes nothing"
+assert_eq "" "$(git -C "$TMP_P/src" status --porcelain --untracked-files=all -- . ':!f')" "no stray files in the checkout"
+git clone -q "$TMP_P/src" "$TMP_P/other"
+printf 'x\n' > "$TMP_P/other/f"
+err=$( (apply_patches "$TMP_P/other" "$TMP_P/patches") 2>&1 ); rc=$?
+assert_eq 1 "$rc" "apply_patches fails when a patch does not apply"
+assert_contains "$err" "0001-b.patch" "failing patch named"
+printf 'changed\n' >> "$TMP_P/patches/0002-c.patch"
+err=$( (apply_patches "$TMP_P/src" "$TMP_P/patches") 2>&1 ); rc=$?
+assert_eq 1 "$rc" "apply_patches refuses when the patches changed since they were applied"
+assert_contains "$err" "changed" "says the patches changed"
+rm -rf "$TMP_P"
+
 # integration: real Wine build (slow)
 if [ "${WINE_IT:-}" = 1 ]; then
     LOG="$WORK_DIR/build-wine-test.log"

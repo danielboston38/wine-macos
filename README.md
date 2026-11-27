@@ -1,7 +1,8 @@
 # wine-macos
 
 Build scripts that turn an upstream [Wine](https://www.winehq.org) release into a
-self-contained `Wine.app` for macOS on Apple Silicon. Wine itself is not patched.
+self-contained `Wine.app` for macOS on Apple Silicon. Wine gets only the fixes in
+[`patches/`](#patches).
 
 The app holds Wine and every library it needs, so it does not need Homebrew at run time.
 It runs 64-bit and 32-bit Windows programs. Wine is built for Intel (x86_64), so it runs
@@ -89,6 +90,18 @@ WINE=/Applications/Wine-11.22.app/Contents/MacOS/wine scripts/install-dxvk.sh ~/
 The script downloads a pinned release, checks its checksum, copies the DLLs into the prefix
 and sets the DLL overrides. Leave out `WINE=` if `wine` is on your PATH. To go back to Wine's
 own Direct3D, delete the `d3d11` and `d3d10core` overrides in `winecfg` (Libraries tab).
+
+## Patches
+
+The build applies every `patches/*.patch` to the Wine source, in name order, before it
+compiles. Each patch is also sent upstream to Wine. Remove a patch when the Wine release
+you build includes it.
+
+- `0001-win32u-...`: lets one process draw into a window that belongs to another process.
+  Without it, Steam and other apps built on Chromium (CEF) show a black window.
+
+If you change the patches after a build, reset the Wine source first. The build stops
+and prints the command to do this.
 
 ## Tests
 

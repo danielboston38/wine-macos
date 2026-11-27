@@ -55,6 +55,27 @@ configure_wine() {
     check_wine_config "$build/include/config.h"
 }
 
+# apply_patches <src> <patch_dir>: apply <patch_dir>/*.patch to the Wine
+# checkout <src>, in name order, once. A stamp in the checkout's git dir
+# records what was applied, so reruns are no-ops; if the patches change, stop
+# rather than guess, since the checkout would need resetting first.
+apply_patches() {
+    local src=$1 dir=$2 stamp sum patch
+    local patches=("$dir"/*.patch)
+    [ -e "${patches[0]}" ] || return 0
+    stamp=$(git -C "$src" rev-parse --path-format=absolute --git-path wine-macos-patches) || die "not a git checkout: $src"
+    sum=$(cat "${patches[@]}" | shasum -a 256)
+    if [ -e "$stamp" ]; then
+        [ "$(cat "$stamp")" = "$sum" ] && return 0
+        die "patches in $dir changed since they were applied to $src; reset it first: git -C \"$src\" checkout -- . && rm \"$stamp\""
+    fi
+    for patch in "${patches[@]}"; do
+        log "applying $(basename "$patch")"
+        git -C "$src" apply "$patch" >&2 || die "patch does not apply: $(basename "$patch")"
+    done
+    echo "$sum" > "$stamp"
+}
+
 main() {
     local tag=$1 src build stage
     validate_tag "$tag"
@@ -66,6 +87,7 @@ main() {
         log "checking out $tag"
         git -C "$WINE_GIT" worktree add --detach "$src" "$tag" >&2
     fi
+    apply_patches "$src" "$REPO_ROOT/patches"
 
     x86_env
     if command -v ccache >/dev/null; then

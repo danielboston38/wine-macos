@@ -1,0 +1,403 @@
+From c294da622ab8c136c900762ca4913d380363eed0 Mon Sep 17 00:00:00 2001
+From: Mark Dymek <mark@dymek.me>
+Date: Fri, 27 Nov 2026 00:34:44 -0500
+Subject: [PATCH] win32u: Draw into windows of other processes through shared
+ memory.
+
+On drivers without pGetDC (winemac), a DC for a window whose toplevel is
+owned by another process got no surface, so all drawing to it was
+silently lost. This breaks Chromium-based apps (Steam, CEF) whose GPU
+process draws the UI into a browser-process window with GetDC.
+
+Draw into a shared memory surface instead, and on ReleaseDC send it to
+the toplevel's owner, which copies the dirty area into its window.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/win32u/dce.c            | 247 +++++++++++++++++++++++++++++++++++
+ dlls/win32u/driver.c         |   6 +
+ dlls/win32u/message.c        |   2 +
+ dlls/win32u/spy.c            |   3 +-
+ dlls/win32u/win32u_private.h |   2 +
+ include/ntuser.h             |   1 +
+ 6 files changed, 260 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 67d3dc84bc7..859bb3db29a 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -41,6 +41,7 @@ struct dce
+     HWND        hwnd;
+     HRGN        clip_rgn;
+     UINT        flags;
++    struct window_surface *xproc_surface; /* for drawing into another process's window */
+     LONG        count;         /* usage count; 0 or 1 for cache DCEs, always 1 for window DCEs,
+                                   always >= 1 for class DCEs */
+ };
+@@ -809,6 +810,238 @@ static void dump_rdw_flags(UINT flags)
+ #undef RDW_FLAGS
+ }
+ 
++/*******************************************************************
++ * Cross-process window surface.
++ *
++ * A DC for a window owned by another process normally needs help from the
++ * display driver (pGetDC; winex11 points the DC at the X window). Drivers
++ * without it (winemac) would silently drop such drawing. Instead, draw into
++ * shared memory and have the window owner copy the dirty part into its own
++ * window, when the DC is released.
++ */
++
++/* at the start of the shared section, followed by the pixels */
++struct xproc_shared
++{
++    user_handle_t    hwnd;       /* window the DC was drawing to */
++    RECT             dirty;      /* area to copy, in DC coordinates */
++    UINT             dcx_flags;  /* DCX_WINDOW and clipping flags of the drawing DC */
++    BITMAPINFOHEADER info;       /* pixel format of the bits */
++};
++
++#define XPROC_BITS_OFFSET 256  /* keeps the bits page-agnostic but 16-byte aligned */
++C_ASSERT( sizeof(struct xproc_shared) <= XPROC_BITS_OFFSET );
++
++struct xproc_surface
++{
++    struct window_surface header;
++    struct xproc_shared  *shared;         /* our view of the section header */
++    HANDLE                remote_section; /* section handle in the toplevel owner's process */
++    HWND                  toplevel;       /* owned by another process, does the copying */
++    UINT                  dcx_flags;
++};
++
++static struct xproc_surface *get_xproc_surface( struct window_surface *surface )
++{
++    return CONTAINING_RECORD( surface, struct xproc_surface, header );
++}
++
++static void xproc_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
++{
++}
++
++static BOOL xproc_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
++                                 const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
++                                 const BITMAPINFO *shape_info, const void *shape_bits )
++{
++    struct xproc_surface *surface = get_xproc_surface( window_surface );
++
++    TRACE( "hwnd %p dirty %s\n", window_surface->hwnd, wine_dbgstr_rect( dirty ));
++
++    surface->shared->hwnd = wine_server_user_handle( window_surface->hwnd );
++    surface->shared->dirty = *dirty;
++    surface->shared->dcx_flags = surface->dcx_flags;
++    /* Send to the toplevel, not the window itself: that may be ours (our child
++     * inside another process's window). Synchronous, so the owner reads the
++     * bits before we draw again. */
++    return send_message_timeout( surface->toplevel, WM_WINE_FLUSH_XPROC_SURFACE,
++                                 (WPARAM)surface->remote_section, 0,
++                                 SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, FALSE ) != 0;
++}
++
++/* close a handle we put into another process */
++static void close_remote_handle( HWND hwnd, HANDLE handle )
++{
++    OBJECT_ATTRIBUTES attr = { .Length = sizeof(attr) };
++    CLIENT_ID cid = { 0 };
++    HANDLE process;
++    DWORD pid;
++
++    if (!get_window_thread( hwnd, &pid )) return;  /* window gone, so its process may be too */
++    cid.UniqueProcess = ULongToHandle( pid );
++    if (NtOpenProcess( &process, PROCESS_DUP_HANDLE, &attr, &cid )) return;
++    if (!NtDuplicateObject( process, handle, GetCurrentProcess(), &handle, 0, 0, DUPLICATE_CLOSE_SOURCE ))
++        NtClose( handle );
++    NtClose( process );
++}
++
++static void xproc_surface_destroy( struct window_surface *window_surface )
++{
++    struct xproc_surface *surface = get_xproc_surface( window_surface );
++
++    TRACE( "hwnd %p surface %p\n", window_surface->hwnd, surface );
++    if (surface->remote_section) close_remote_handle( surface->toplevel, surface->remote_section );
++    if (surface->shared) NtUnmapViewOfSection( GetCurrentProcess(), surface->shared );
++}
++
++static const struct window_surface_funcs xproc_surface_funcs =
++{
++    .size = sizeof(struct xproc_surface),
++    .set_clip = xproc_surface_set_clip,
++    .flush = xproc_surface_flush,
++    .destroy = xproc_surface_destroy,
++};
++
++static struct window_surface *create_xproc_surface( HWND hwnd, HWND toplevel, const RECT *rect )
++{
++    OBJECT_ATTRIBUTES attr = { .Length = sizeof(attr) };
++    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
++    BITMAPINFO *info = (BITMAPINFO *)buffer;
++    struct xproc_surface *surface;
++    struct window_surface *window_surface;
++    HANDLE section, process;
++    LARGE_INTEGER size;
++    CLIENT_ID cid = { 0 };
++    SIZE_T view_size = 0;
++    void *view = NULL;
++    HBITMAP bitmap;
++    DWORD pid;
++
++    memset( info, 0, sizeof(*info) );
++    info->bmiHeader.biSize        = sizeof(info->bmiHeader);
++    info->bmiHeader.biWidth       = rect->right;
++    info->bmiHeader.biHeight      = -rect->bottom;  /* top-down */
++    info->bmiHeader.biPlanes      = 1;
++    info->bmiHeader.biBitCount    = 32;
++    info->bmiHeader.biCompression = BI_RGB;
++    info->bmiHeader.biSizeImage   = get_dib_image_size( info );
++
++    if (!get_window_thread( toplevel, &pid )) return NULL;
++    cid.UniqueProcess = ULongToHandle( pid );
++
++    size.QuadPart = XPROC_BITS_OFFSET + info->bmiHeader.biSizeImage;
++    if (NtCreateSection( &section, SECTION_MAP_READ | SECTION_MAP_WRITE | SECTION_QUERY, NULL, &size,
++                         PAGE_READWRITE, SEC_COMMIT, 0 ))
++        return NULL;
++    if (NtMapViewOfSection( section, GetCurrentProcess(), &view, 0, 0, NULL, &view_size,
++                            ViewShare, 0, PAGE_READWRITE ))
++        goto failed;
++    if (!(bitmap = NtGdiCreateDIBSection( 0, section, XPROC_BITS_OFFSET, info, DIB_RGB_COLORS, 0, 0, 0, NULL )))
++        goto failed;
++    if (!(window_surface = window_surface_create( &xproc_surface_funcs, hwnd, rect, info, bitmap )))
++    {
++        NtGdiDeleteObjectApp( bitmap );
++        goto failed;
++    }
++    surface = get_xproc_surface( window_surface );
++    surface->toplevel = toplevel;
++    surface->shared = view;
++    surface->shared->info = info->bmiHeader;
++
++    if (!NtOpenProcess( &process, PROCESS_DUP_HANDLE, &attr, &cid ))
++    {
++        NtDuplicateObject( GetCurrentProcess(), section, process, &surface->remote_section,
++                           SECTION_MAP_READ | SECTION_QUERY, 0, 0 );
++        NtClose( process );
++    }
++    NtClose( section );
++    if (!surface->remote_section)
++    {
++        window_surface_release( window_surface );
++        return NULL;
++    }
++
++    TRACE( "hwnd %p toplevel %p pid %04x rect %s surface %p\n", hwnd, toplevel, pid,
++           wine_dbgstr_rect( rect ), surface );
++    return window_surface;
++
++failed:
++    if (view) NtUnmapViewOfSection( GetCurrentProcess(), view );
++    NtClose( section );
++    return NULL;
++}
++
++/* return a referenced surface for drawing into dce->hwnd, owned by another process */
++static struct window_surface *get_dce_xproc_surface( struct dce *dce, HWND toplevel, const RECT *win_rect,
++                                                     UINT flags )
++{
++    RECT rect = *win_rect;
++    struct window_surface *surface = dce->xproc_surface;
++
++    OffsetRect( &rect, -rect.left, -rect.top );
++    if (IsRectEmpty( &rect )) return NULL;
++
++    if (!surface || surface->hwnd != dce->hwnd || get_xproc_surface( surface )->toplevel != toplevel ||
++        !EqualRect( &surface->rect, &rect ))
++    {
++        if (surface) window_surface_release( surface );
++        surface = dce->xproc_surface = create_xproc_surface( dce->hwnd, toplevel, &rect );
++        if (!surface) return NULL;
++    }
++    get_xproc_surface( surface )->dcx_flags = flags;
++    window_surface_add_ref( surface );
++    return surface;
++}
++
++/* toplevel owner side: copy what another process drew, see xproc_surface_flush */
++LRESULT flush_xproc_surface( HWND toplevel, HANDLE section )
++{
++    const struct xproc_shared *shared;
++    struct ratio dpi = get_dpi_for_window( toplevel );
++    SIZE_T view_size = 0;
++    void *view = NULL;
++    BITMAPINFO info;
++    RECT dirty, top_rect, rect;
++    UINT height;
++    HWND hwnd;
++    HDC hdc;
++
++    if (NtMapViewOfSection( section, GetCurrentProcess(), &view, 0, 0, NULL, &view_size,
++                            ViewShare, 0, PAGE_READONLY ))
++    {
++        WARN( "toplevel %p: cannot map section %p\n", toplevel, section );
++        return 0;
++    }
++    shared = view;
++    hwnd = wine_server_ptr_handle( shared->hwnd );
++    dirty = shared->dirty;
++    memset( &info, 0, sizeof(info) );
++    info.bmiHeader = shared->info;
++    height = abs( info.bmiHeader.biHeight );
++
++    /* where the drawing DC's origin is, relative to our window DC */
++    get_window_rect( toplevel, &top_rect, dpi );
++    if (shared->dcx_flags & DCX_WINDOW) get_window_rect( hwnd, &rect, dpi );
++    else if (get_client_rect( hwnd, &rect, dpi )) map_window_points( hwnd, 0, (POINT *)&rect, 2, dpi );
++
++    TRACE( "toplevel %p hwnd %p dirty %s offset %d,%d\n", toplevel, hwnd, wine_dbgstr_rect( &dirty ),
++           rect.left - top_rect.left, rect.top - top_rect.top );
++
++    /* the drawing side already clipped to the visible region */
++    if ((hdc = NtUserGetDCEx( toplevel, 0, DCX_CACHE | DCX_WINDOW )))
++    {
++        NtGdiSetDIBitsToDeviceInternal( hdc, rect.left - top_rect.left + dirty.left,
++                                        rect.top - top_rect.top + dirty.top,
++                                        dirty.right - dirty.left, dirty.bottom - dirty.top,
++                                        dirty.left, height - dirty.bottom, 0, height,
++                                        (char *)view + XPROC_BITS_OFFSET, &info,
++                                        DIB_RGB_COLORS, 0, 0, FALSE, NULL );
++        NtUserReleaseDC( toplevel, hdc );
++    }
++    NtUnmapViewOfSection( GetCurrentProcess(), view );
++    return 1;
++}
++
+ /***********************************************************************
+  *           update_visible_region
+  *
+@@ -877,6 +1110,11 @@ static void update_visible_region( struct dce *dce )
+             if (surface) window_surface_add_ref( surface );
+             release_win_ptr( win );
+         }
++        else if (win == WND_OTHER_PROCESS && !driver_draws_other_process_windows() &&
++                 (surface = get_dce_xproc_surface( dce, top_win, &win_rect, flags )))
++        {
++            top_rect = win_rect;  /* the surface starts at the DC origin */
++        }
+     }
+ 
+     if (!surface) SetRectEmpty( &top_rect );
+@@ -895,6 +1133,8 @@ static void release_dce( struct dce *dce )
+     user_driver->pReleaseDC( dce->hwnd, dce->hdc );
+ 
+     if (dce->clip_rgn) NtGdiDeleteObjectApp( dce->clip_rgn );
++    if (dce->xproc_surface) window_surface_release( dce->xproc_surface );
++    dce->xproc_surface = NULL;
+     dce->clip_rgn = 0;
+     dce->hwnd     = 0;
+     dce->flags   &= DCX_CACHE;
+@@ -1231,6 +1471,7 @@ void invalidate_dce( WND *win, const RECT *old_rect )
+ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
+ {
+     struct list drawables = LIST_INIT( drawables );
++    struct window_surface *xproc_surface = NULL;
+     struct dce *dce;
+     BOOL ret = FALSE;
+ 
+@@ -1240,6 +1481,7 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
+     dce = get_dc_dce( hdc );
+     if (dce && dce->count && dce->hwnd)
+     {
++        if ((xproc_surface = dce->xproc_surface)) window_surface_add_ref( xproc_surface );
+         if (!(dce->flags & DCX_NORESETATTRS)) set_dce_flags( dce->hdc, DCHF_RESETDC );
+         if (end_paint || (dce->flags & DCX_CACHE)) delete_clip_rgn( dce );
+         if (dce->flags & DCX_CACHE)
+@@ -1252,6 +1494,11 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
+     }
+     user_unlock();
+ 
++    if (xproc_surface)
++    {
++        window_surface_flush( xproc_surface );
++        window_surface_release( xproc_surface );
++    }
+     release_opengl_drawables( &drawables );
+     return ret;
+ }
+diff --git a/dlls/win32u/driver.c b/dlls/win32u/driver.c
+index 0328cd5ca74..2430faace0a 100644
+--- a/dlls/win32u/driver.c
++++ b/dlls/win32u/driver.c
+@@ -1056,6 +1056,12 @@ static const struct user_driver_funcs *load_driver(void)
+     return user_driver;
+ }
+ 
++/* can the driver draw into windows of other processes? (see update_visible_region) */
++BOOL driver_draws_other_process_windows(void)
++{
++    return load_driver()->pGetDC != nulldrv_GetDC;
++}
++
+ void init_display_driver(void)
+ {
+     if (user_driver == &lazy_load_driver) load_display_driver();
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index de1a4841789..220fc62761e 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2274,6 +2274,8 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
+     case WM_WINE_SETPIXELFORMAT:
+         set_window_pixel_format( hwnd, wparam, lparam );
+         return 0;
++    case WM_WINE_FLUSH_XPROC_SURFACE:
++        return flush_xproc_surface( hwnd, (HANDLE)wparam );
+     case WM_WINE_TRACKMOUSEEVENT:
+     {
+         TRACKMOUSEEVENT info;
+diff --git a/dlls/win32u/spy.c b/dlls/win32u/spy.c
+index 80961c9ee20..e65f7612cdf 100644
+--- a/dlls/win32u/spy.c
++++ b/dlls/win32u/spy.c
+@@ -1127,7 +1127,7 @@ static const char * const CCMMessageTypeNames[SPY_MAX_CCMMSGNUM + 1] =
+     "CCM_SETNOTIFYWINDOW"
+ };
+ 
+-#define SPY_MAX_WINEMSGNUM   (WM_WINE_SETPIXELFORMAT - WM_WINE_DESTROYWINDOW)
++#define SPY_MAX_WINEMSGNUM   (WM_WINE_FLUSH_XPROC_SURFACE - WM_WINE_DESTROYWINDOW)
+ static const char * const WINEMessageTypeNames[SPY_MAX_WINEMSGNUM + 1] =
+ {
+     "WM_WINE_DESTROYWINDOW",
+@@ -1147,6 +1147,7 @@ static const char * const WINEMessageTypeNames[SPY_MAX_WINEMSGNUM + 1] =
+     "WM_WINE_SWAPCHAIN_PRESENT",
+     "WM_WINE_SWAPCHAIN_DESTROY",
+     "WM_WINE_SETPIXELFORMAT",
++    "WM_WINE_FLUSH_XPROC_SURFACE",
+ };
+ 
+ #define SPY_MAX_WINE_DRIVER_MSGNUM (WM_WINE_SETCURSOR - WM_WINE_CLIPCURSOR)
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 4f3eea733dc..112b1d5265b 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -139,6 +139,8 @@ extern LRESULT send_internal_message_timeout( DWORD dest_pid, DWORD dest_tid, UI
+                                               PDWORD_PTR res_ptr );
+ extern LRESULT send_message( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam );
+ extern BOOL send_notify_message( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, BOOL ansi );
++extern BOOL driver_draws_other_process_windows(void);
++extern LRESULT flush_xproc_surface( HWND hwnd, HANDLE section );
+ extern LRESULT send_message_timeout( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
+                                      UINT flags, UINT timeout, BOOL ansi );
+ extern size_t user_message_size( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
+diff --git a/include/ntuser.h b/include/ntuser.h
+index ad0eccb0519..328f7e63176 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -643,6 +643,7 @@ enum wine_internal_message
+     WM_WINE_SWAPCHAIN_PRESENT,
+     WM_WINE_SWAPCHAIN_DESTROY,
+     WM_WINE_SETPIXELFORMAT,
++    WM_WINE_FLUSH_XPROC_SURFACE,
+     WM_WINE_FIRST_DRIVER_MSG = 0x80001000,  /* range of messages reserved for the USER driver */
+     WM_WINE_CLIPCURSOR = 0x80001ff0, /* internal driver notification messages */
+     WM_WINE_SETCURSOR,
+-- 
+2.54.0 (Apple Git-157)
+
